@@ -65,7 +65,9 @@ download_file() {
   if command -v aria2c >/dev/null 2>&1; then
     connections="$(detect_download_connections)"
     cpu_count="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo unknown)"
-    echo "Using downloader: aria2c (cpu_count=${cpu_count}, connections=${connections}, min_split_size=${ARIA2_MIN_SPLIT_SIZE})"
+    echo "Using downloader: aria2c (cpu_count=${cpu_count}, connections=${connections}, min_split_size=${ARIA2_MIN_SPLIT_SIZE})" >&2
+    # aria2c prints its progress to stdout; redirect everything to stderr so
+    # callers capturing stdout (e.g. CI piping JSON through jq) get clean output.
     aria2c \
       --allow-overwrite=true \
       --auto-file-renaming=false \
@@ -82,11 +84,11 @@ download_file() {
       --min-split-size="${ARIA2_MIN_SPLIT_SIZE}" \
       --dir="$dir_path" \
       --out="$file_name" \
-      "$url"
+      "$url" 1>&2
     return
   fi
 
-  echo "Using downloader: curl"
+  echo "Using downloader: curl" >&2
   curl "${CURL_RETRY_ARGS[@]}" -fL "$url" -o "$dest"
 }
 
@@ -221,16 +223,16 @@ fi
 
 if [[ "$FORCE" != "true" && -n "$cached_zip" && -s "$cached_zip" ]]; then
   # Probe: only reuse the cache if its sha256 still matches the upstream zip.
-  echo "Probing upstream zip to validate cache..."
+  echo "Probing upstream zip to validate cache..." >&2
   probe="$workdir/probe.zip"
   if download_file "$ZIP_URL" "$probe"; then
     probe_sha="$(sha256sum "$probe" | awk '{print $1}')"
     cache_sha="$(sha256sum "$cached_zip" | awk '{print $1}')"
     if [[ "$probe_sha" == "$cache_sha" ]]; then
-      echo "Using cached zip (sha256 matches upstream): $cached_zip"
+      echo "Using cached zip (sha256 matches upstream): $cached_zip" >&2
       cp -f "$cached_zip" "$zip_path"
     else
-      echo "Cache stale (upstream sha256 differs); redownloading."
+      echo "Cache stale (upstream sha256 differs); redownloading." >&2
       cp -f "$probe" "$zip_path"
       cp -f "$zip_path" "$cached_zip"
     fi
@@ -240,16 +242,16 @@ if [[ "$FORCE" != "true" && -n "$cached_zip" && -s "$cached_zip" ]]; then
   fi
 else
   if [[ "$FORCE" == "true" && -n "$cached_zip" && -e "$cached_zip" ]]; then
-    echo "[FORCE] Skipping cached zip restore: $cached_zip"
+    echo "[FORCE] Skipping cached zip restore: $cached_zip" >&2
   fi
-  echo "Downloading latest zip: $ZIP_URL"
+  echo "Downloading latest zip: $ZIP_URL" >&2
   if ! download_file "$ZIP_URL" "$zip_path"; then
     echo "Failed to download zip: $ZIP_URL" >&2
     exit 1
   fi
   if [[ -n "$cached_zip" ]]; then
     cp -f "$zip_path" "$cached_zip"
-    echo "Saved zip to cache: $cached_zip"
+    echo "Saved zip to cache: $cached_zip" >&2
   fi
 fi
 
@@ -291,7 +293,7 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
   exit 0
 fi
 
-echo "Detection result: status=${status}, reason=${reason}, current=${current_ver:-unknown}@${current_sha:-none}, latest=${latest_ver}@${latest_sha}"
+echo "Detection result: status=${status}, reason=${reason}, current=${current_ver:-unknown}@${current_sha:-none}, latest=${latest_ver}@${latest_sha}" >&2
 
 if [[ "$needs_update" != "true" ]]; then
   echo "Already up to date: ${latest_ver}"
@@ -299,7 +301,7 @@ if [[ "$needs_update" != "true" ]]; then
 fi
 
 if [[ "$reason" == "FORCE" ]]; then
-  echo "[FORCE] Upstream unchanged, but forcing refresh for CI test."
+  echo "[FORCE] Upstream unchanged, but forcing refresh for CI test." >&2
 fi
 
 pkgrel=1
@@ -307,7 +309,7 @@ if [[ "$FORCE" == "true" && "$current_ver" == "$latest_ver" && "$current_sha" ==
   if [[ "$current_pkgrel" =~ ^[0-9]+$ && "$current_pkgrel" -ge 1 ]]; then
     pkgrel=$((current_pkgrel + 1))
   fi
-  echo "Refreshing same upstream version; bumping pkgrel to ${pkgrel} so AUR users see a new package revision."
+  echo "Refreshing same upstream version; bumping pkgrel to ${pkgrel} so AUR users see a new package revision." >&2
 fi
 
 sed -i "s/^_upstream_ver=.*/_upstream_ver=${latest_ver}/" PKGBUILD
