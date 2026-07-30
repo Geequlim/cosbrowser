@@ -1,0 +1,227 @@
+name: Auto Update
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force refresh and recompute sha when upstream silently replaces the zip'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install Dependencies
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed \
+            ca-certificates git base-devel jq curl aria2 openssh util-linux libarchive
+          update-ca-trust || true
+          git --version
+          jq --version
+          curl --version
+          aria2c --version | head -n1
+          bsdtar --version
+          ssh -V || true
+
+      - name: Prepare builder user and repo dir
+        run: |
+          set -euo pipefail
+          id -u builder >/dev/null 2>&1 || useradd -m builder
+          rm -rf /repo
+          mkdir -p /repo
+          chown -R builder:builder /repo
+
+          # ensure cache dir exists and is writable
+          install -d -m 700 -o builder -g builder /home/builder/.cache/cosbrowser-bin
+
+      - name: Clone repo (clean, real .git)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ref="${REF_NAME:-main}"
+
+          runuser -u builder -- bash -lc "
+            set -euo pipefail
+            cd /
+            git clone --branch \"$ref\" \
+              \"https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git\" /repo
+            cd /repo
+            test -d .git
+            git rev-parse --show-toplevel
+          "
+
+      - name: Detect upstream update
+        id: detect
+        env:
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+
+          detection_json="$(runuser -u builder -- bash -lc "
+            set -euo pipefail
+            cd /repo
+            FORCE='${FORCE}' ./scripts/update.sh --check-only --format json
+          ")"
+
+          echo "Detection result:"
+          printf '%s\n' "$detection_json" | jq .
+
+          echo "needs_update=$(printf '%s' "$detection_json" | jq -r '.needs_update')" >> "$GITHUB_OUTPUT"
+          echo "reason=$(printf '%s' "$detection_json" | jq -r '.reason')" >> "$GITHUB_OUTPUT"
+          echo "current_ver=$(printf '%s' "$detection_json" | jq -r '.current_ver')" >> "$GITHUB_OUTPUT"
+          echo "latest_ver=$(printf '%s' "$detection_json" | jq -r '.latest_ver')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache zip
+        if: steps.detect.outputs.needs_update == 'true'
+        uses: actions/cache@v4
+        with:
+          path: /home/builder/.cache/cosbrowser-bin
+          key: cosbrowser-bin-zip-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            cosbrowser-bin-zip-${{ runner.os }}-
+
+      - name: Download zip and update PKGBUILD
+        if: steps.detect.outputs.needs_update == 'true'
+        env:
+          FORCE: ${{ inputs.force || 'false' }}
+          CACHE_DIR: /home/builder/.cache/cosbrowser-bin
+          CURRENT_VER: ${{ steps.detect.outputs.current_ver }}
+          LATEST_VER: ${{ steps.detect.outputs.latest_ver }}
+        run: |
+          set -euo pipefail
+          echo "Applying update: ${CURRENT_VER:-unknown} -> ${LATEST_VER}"
+          runuser -u builder -- bash -lc "
+            set -euo pipefail
+            cd /repo
+            FORCE='${FORCE}' CACHE_DIR='${CACHE_DIR}' ./scripts/update.sh
+          "
+
+      - name: Detect Changes
+        id: diff
+        run: |
+          set -euo pipefail
+          changed="$(runuser -u builder -- bash -lc '
+            set -euo pipefail
+            cd /repo
+            test -d .git
+            if git diff --quiet; then echo false; else echo true; fi
+          ')"
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit And Push
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          runuser -u builder -- bash -lc "
+            set -euo pipefail
+            cd /repo
+            test -d .git
+
+            ver=\$(sed -n 's/^_upstream_ver=//p' PKGBUILD | head -n1 | tr -d '\r\n')
+            if [[ -z \"\$ver\" ]]; then
+              echo 'Cannot read _upstream_ver from PKGBUILD' >&2
+              exit 1
+            fi
+
+            git config user.name 'github-actions[bot]'
+            git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+            git add PKGBUILD .SRCINFO
+            git commit -m \"chore: update to \${ver}\"
+            git push origin HEAD
+          "
+
+      - name: Push To AUR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_PKGNAME: cosbrowser-bin
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${AUR_SSH_PRIVATE_KEY:-}" ]]; then
+            echo "Missing AUR_SSH_PRIVATE_KEY secret" >&2
+            exit 1
+          fi
+
+          # Install SSH key for builder
+          install -d -m 700 -o builder -g builder /home/builder/.ssh
+
+          tmpkey="$(mktemp)"
+          chmod 600 "$tmpkey"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$tmpkey"
+          install -m 600 -o builder -g builder "$tmpkey" /home/builder/.ssh/id_ed25519
+          rm -f "$tmpkey"
+
+          # IMPORTANT: push to AUR from a clean AUR repo clone, not from GitHub repo
+          runuser -u builder -- bash -lc "
+            set -euo pipefail
+
+            ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+            chmod 600 ~/.ssh/known_hosts
+
+            printf '%s\n' \
+              'Host aur.archlinux.org' \
+              '  User aur' \
+              '  IdentityFile ~/.ssh/id_ed25519' \
+              '  IdentitiesOnly yes' \
+              '  StrictHostKeyChecking yes' \
+              > ~/.ssh/config
+            chmod 600 ~/.ssh/config
+
+            # sanity: packaging files must exist in /repo
+            cd /repo
+            test -f PKGBUILD
+            test -f .SRCINFO
+
+            # clone aur repo into a separate dir
+            rm -rf /home/builder/aur-repo
+            git clone \"ssh://aur@aur.archlinux.org/${AUR_PKGNAME}.git\" /home/builder/aur-repo
+            cd /home/builder/aur-repo
+
+            # replace contents with packaging files only (AUR hook expects PKGBUILD at root)
+            find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+
+            cp -f /repo/PKGBUILD .
+            cp -f /repo/.SRCINFO .
+            if [[ -f /repo/${AUR_PKGNAME}.install ]]; then
+              cp -f /repo/${AUR_PKGNAME}.install .
+            fi
+
+            # verify PKGBUILD is really present before commit
+            test -f PKGBUILD
+
+            git add -A
+            if git diff --cached --quiet; then
+              echo 'AUR repo already up to date; nothing to push.'
+              exit 0
+            fi
+
+            ver=\$(sed -n 's/^_upstream_ver=//p' PKGBUILD | head -n1 | tr -d '\r\n')
+            git config user.name 'github-actions[bot]'
+            git config user.email 'github-actions[bot]@users.noreply.github.com'
+            git commit -m \"chore: update to \${ver}\"
+            git push origin master
+          "
