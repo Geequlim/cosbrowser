@@ -26,6 +26,11 @@ ZIP_URL="https://cosbrowser.cloud.tencent.com/cosbrowser-latest-linux.zip"
 CURL_RETRY_ARGS=(--http1.1 --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 30)
 ARIA2_MIN_SPLIT_SIZE="${ARIA2_MIN_SPLIT_SIZE:-5M}"
 
+# Persistent probe state: records the upstream ETag/Last-Modified/sha seen on
+# the last successful run. Lets nightly checks issue a tiny HEAD request and
+# short-circuit without re-downloading the 119MB zip when nothing changed.
+PROBE_FILE="${ROOT_DIR}/.upstream-probe"
+
 detect_download_connections() {
   local configured="${ARIA2_CONNECTIONS:-}"
   local cpu_count
@@ -111,10 +116,43 @@ version_from_zip() {
 changelog_latest_version() {
   # First "## vX.Y.Z - <date>" heading in changelog.md.
   curl "${CURL_RETRY_ARGS[@]}" -fsSL "$CHANGELOG_URL" \
-    | grep -E '^## v[0-9]' \
+    | grep '^## v[0-9]' \
     | head -n1 \
     | sed -E 's/^## v([0-9][0-9.]+).*/\1/' \
     || true
+}
+
+# Probe upstream with a lightweight HEAD (following redirects) and print the
+# final ETag and Last-Modified headers as "etag<TAB>lastmod", empty if absent.
+probe_upstream_headers() {
+  local etag lastmod
+  etag=$(curl "${CURL_RETRY_ARGS[@]}" -sIL "$ZIP_URL" \
+    | tr -d '\r' \
+    | awk 'tolower($1)=="etag:" {gsub(/^"|"$/,"",$2); print $2}' \
+    | tail -n1)
+  lastmod=$(curl "${CURL_RETRY_ARGS[@]}" -sIL "$ZIP_URL" \
+    | tr -d '\r' \
+    | awk 'tolower($1)=="last-modified:" {$1=""; sub(/^ /,""); print}' \
+    | tail -n1)
+  printf '%s\t%s' "${etag:-}" "${lastmod:-}"
+}
+
+# Read a field from .upstream-probe (key=value lines).
+probe_get() {
+  local key="$1"
+  [[ -f "$PROBE_FILE" ]] || return 0
+  sed -n "s/^${key}=//p" "$PROBE_FILE" | head -n1
+}
+
+# Persist the latest probe state so the next run can short-circuit.
+probe_write() {
+  local etag="$1" lastmod="$2" ver="$3" sha="$4"
+  {
+    printf 'etag=%s\n' "$etag"
+    printf 'lastmod=%s\n' "$lastmod"
+    printf 'version=%s\n' "$ver"
+    printf 'sha256=%s\n' "$sha"
+  } > "$PROBE_FILE"
 }
 
 FORCE="${FORCE:-false}"
@@ -214,49 +252,79 @@ trap 'rm -rf "$workdir"' EXIT
 # The latest zip is the single source of truth for the actual shippable build.
 zip_path="$workdir/cosbrowser-linux.zip"
 
-# ---------- zip cache (so re-runs/CI don't redownload 125MB) ----------
-cached_zip=""
-if [[ -n "$CACHE_DIR" ]]; then
-  mkdir -p "$CACHE_DIR"
-  cached_zip="${CACHE_DIR}/cosbrowser-latest-linux.zip"
+# ---------- fast probe: skip the 119MB download when upstream is unchanged ---
+probe_hit=false
+latest_sha=""
+latest_ver=""
+
+if [[ "$FORCE" != "true" ]]; then
+  echo "Probing upstream headers (HEAD)..." >&2
+  IFS=$'\t' read -r probe_etag probe_lastmod <<< "$(probe_upstream_headers)"
+  known_etag="$(probe_get etag)"
+  known_lastmod="$(probe_get lastmod)"
+  known_sha="$(probe_get sha256)"
+  known_ver="$(probe_get version)"
+
+  if [[ -n "$probe_etag" && "$probe_etag" == "$known_etag" && -n "$known_sha" && -n "$known_ver" ]]; then
+    echo "Upstream unchanged (ETag match: ${probe_etag}); skipping zip download." >&2
+    probe_hit=true
+    latest_sha="$known_sha"
+    latest_ver="$known_ver"
+  elif [[ -z "$probe_etag" && -n "$probe_lastmod" && "$probe_lastmod" == "$known_lastmod" && -n "$known_sha" && -n "$known_ver" ]]; then
+    echo "Upstream unchanged (Last-Modified match); skipping zip download." >&2
+    probe_hit=true
+    latest_sha="$known_sha"
+    latest_ver="$known_ver"
+  fi
 fi
 
-if [[ "$FORCE" != "true" && -n "$cached_zip" && -s "$cached_zip" ]]; then
-  # Probe: only reuse the cache if its sha256 still matches the upstream zip.
-  echo "Probing upstream zip to validate cache..." >&2
-  probe="$workdir/probe.zip"
-  if download_file "$ZIP_URL" "$probe"; then
-    probe_sha="$(sha256sum "$probe" | awk '{print $1}')"
-    cache_sha="$(sha256sum "$cached_zip" | awk '{print $1}')"
-    if [[ "$probe_sha" == "$cache_sha" ]]; then
-      echo "Using cached zip (sha256 matches upstream): $cached_zip" >&2
-      cp -f "$cached_zip" "$zip_path"
+# ---------- full download path (only when the probe says something changed) --
+if [[ "$probe_hit" != "true" ]]; then
+  # ---------- zip cache (so re-runs/CI don't redownload 125MB) ----------
+  cached_zip=""
+  if [[ -n "$CACHE_DIR" ]]; then
+    mkdir -p "$CACHE_DIR"
+    cached_zip="${CACHE_DIR}/cosbrowser-latest-linux.zip"
+  fi
+
+  if [[ "$FORCE" != "true" && -n "$cached_zip" && -s "$cached_zip" ]]; then
+    # Probe: only reuse the cache if its sha256 still matches the upstream zip.
+    echo "Validating cached zip against upstream..." >&2
+    probe="$workdir/probe.zip"
+    if download_file "$ZIP_URL" "$probe"; then
+      probe_sha="$(sha256sum "$probe" | awk '{print $1}')"
+      cache_sha="$(sha256sum "$cached_zip" | awk '{print $1}')"
+      if [[ "$probe_sha" == "$cache_sha" ]]; then
+        echo "Using cached zip (sha256 matches upstream): $cached_zip" >&2
+        cp -f "$cached_zip" "$zip_path"
+      else
+        echo "Cache stale (upstream sha256 differs); redownloading." >&2
+        cp -f "$probe" "$zip_path"
+        cp -f "$zip_path" "$cached_zip"
+      fi
     else
-      echo "Cache stale (upstream sha256 differs); redownloading." >&2
-      cp -f "$probe" "$zip_path"
-      cp -f "$zip_path" "$cached_zip"
+      echo "Probe download failed; falling back to cache if present." >&2
+      cp -f "$cached_zip" "$zip_path"
     fi
   else
-    echo "Probe download failed; falling back to cache if present." >&2
-    cp -f "$cached_zip" "$zip_path"
+    if [[ "$FORCE" == "true" && -n "$cached_zip" && -e "$cached_zip" ]]; then
+      echo "[FORCE] Skipping cached zip restore: $cached_zip" >&2
+    fi
+    echo "Downloading latest zip: $ZIP_URL" >&2
+    if ! download_file "$ZIP_URL" "$zip_path"; then
+      echo "Failed to download zip: $ZIP_URL" >&2
+      exit 1
+    fi
+    if [[ -n "$cached_zip" ]]; then
+      cp -f "$zip_path" "$cached_zip"
+      echo "Saved zip to cache: $cached_zip" >&2
+    fi
   fi
-else
-  if [[ "$FORCE" == "true" && -n "$cached_zip" && -e "$cached_zip" ]]; then
-    echo "[FORCE] Skipping cached zip restore: $cached_zip" >&2
-  fi
-  echo "Downloading latest zip: $ZIP_URL" >&2
-  if ! download_file "$ZIP_URL" "$zip_path"; then
-    echo "Failed to download zip: $ZIP_URL" >&2
-    exit 1
-  fi
-  if [[ -n "$cached_zip" ]]; then
-    cp -f "$zip_path" "$cached_zip"
-    echo "Saved zip to cache: $cached_zip" >&2
-  fi
+
+  latest_sha="$(sha256sum "$zip_path" | awk '{print $1}')"
+  latest_ver="$(version_from_zip "$zip_path" || true)"
 fi
 
-latest_sha="$(sha256sum "$zip_path" | awk '{print $1}')"
-latest_ver="$(version_from_zip "$zip_path" || true)"
 changelog_ver="$(changelog_latest_version || true)"
 
 if [[ -z "$latest_ver" ]]; then
@@ -286,6 +354,13 @@ elif [[ "$FORCE" == "true" ]]; then
   status="update-available"
   reason="FORCE"
   needs_update=true
+fi
+
+# Persist probe state so the next nightly run can short-circuit on a HEAD.
+# Only write when we actually obtained fresh headers (non-FORCE path); under
+# FORCE we intentionally want the next run to re-probe fully.
+if [[ "$FORCE" != "true" && -n "${probe_etag:-}" && -n "$latest_sha" && -n "$latest_ver" ]]; then
+  probe_write "$probe_etag" "${probe_lastmod:-}" "$latest_ver" "$latest_sha"
 fi
 
 if [[ "$CHECK_ONLY" == "true" ]]; then

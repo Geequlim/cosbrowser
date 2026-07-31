@@ -13,13 +13,19 @@ This package extracts that AppImage, installs the unpacked app into
 Because Tencent does **not** publish versioned download URLs or GitHub release
 assets, the updater works in two stages:
 
-1. Fetch the latest `changelog.md` from
-   `https://github.com/TencentCloud/cosbrowser/blob/master/changelog.md` — only
-   for a human-readable reference version.
-2. Download `https://cosbrowser.cloud.tencent.com/cosbrowser-latest-linux.zip`,
-   read the real version from the `cosbrowser-<ver>.AppImage` filename inside
-   it, and detect changes by comparing the zip's `sha256` against the value
-   recorded in `PKGBUILD`.
+1. **Fast probe**: issue a lightweight `HEAD` against the latest zip and
+   compare the upstream `ETag`/`Last-Modified` with the values recorded in
+   `.upstream-probe`. If they match, the zip is unchanged and the run
+   short-circuits **without downloading the ~119MB file** — the nightly check
+   stays cheap.
+2. **Full check** (only when the probe sees a change): download
+   `https://cosbrowser.cloud.tencent.com/cosbrowser-latest-linux.zip`, read the
+   real version from the `cosbrowser-<ver>.AppImage` filename inside it, and
+   detect changes by comparing the zip's `sha256` against the value recorded in
+   `PKGBUILD`. The probe state is then refreshed in `.upstream-probe`.
+
+For a human-readable reference version it also peeks at the top of
+`https://github.com/TencentCloud/cosbrowser/blob/master/changelog.md`.
 
 > **Note:** the `latest` zip sometimes lags behind `changelog.md`'s top entry
 > (e.g. the changelog may announce `2.12.2` while the zip still ships
