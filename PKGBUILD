@@ -93,12 +93,22 @@ package() {
   chmod -R a+rX "$pkgdir/opt/cosbrowser"
   [[ -f "$pkgdir/opt/cosbrowser/AppRun" ]] && chmod 755 "$pkgdir/opt/cosbrowser/AppRun"
 
-  # Wrapper script. Both --no-sandbox (no SUID chrome-sandbox under /opt) and
-  # --disable-gpu are required for the app to launch reliably. We also reuse
-  # the Wayland-hybrid workaround from layaair-ide since this is also an
-  # Electron app that can render a black window on native Wayland.
+  # Wrapper script. We launch the Electron binary directly instead of the
+  # upstream AppRun: AppRun's $APPDIR detection assumes the first argument is
+  # a file inside the AppDir (true only when launched by the AppImage
+  # runtime), so passing --no-sandbox as $1 makes it strip the path down to
+  # empty and fail with "/cosbrowser: No such file". We set APPDIR and the
+  # library path ourselves and exec the binary.
+  #
+  # Both --no-sandbox (no SUID chrome-sandbox under /opt) and --disable-gpu
+  # are required for the app to launch reliably. We also reuse the
+  # Wayland-hybrid workaround from layaair-ide since this is also an Electron
+  # app that can render a black window on native Wayland.
   install -Dm755 /dev/stdin "$pkgdir/usr/bin/cosbrowser" <<'EOF_WRAPPER'
 #!/bin/sh
+APPDIR=/opt/cosbrowser
+export APPDIR
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 # Required launch flags: --no-sandbox (no SUID chrome-sandbox under /opt) and
 # --disable-gpu (avoids GPU init failures / blank window on some setups).
@@ -123,7 +133,7 @@ if [ "${XDG_SESSION_TYPE:-}" = 'wayland' ] && [ -n "${DISPLAY:-}" ]; then
   fi
 fi
 
-exec /opt/cosbrowser/AppRun "$@"
+exec "${APPDIR}/cosbrowser" "$@"
 EOF_WRAPPER
 
   install -Dm644 "$srcdir/cosbrowser.desktop" \
